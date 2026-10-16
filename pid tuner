@@ -1,0 +1,385 @@
+import streamlit as st
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from scipy.ndimage import gaussian_filter1d
+import datetime
+
+# ==========================================
+# 1. Dizayn va Sozlamalar
+# ==========================================
+st.set_page_config(page_title="PID-Tuner", layout="wide", page_icon="⚙️")
+
+st.markdown("""
+    <style>
+        [data-testid="stFileUploadDropzone"] { min-height: 250px !important; border: 2px dashed #4A90E2 !important; border-radius: 15px !important; background-color: rgba(74, 144, 226, 0.05) !important; display: flex !important; justify-content: center !important; align-items: center !important; transition: all 0.3s ease !important; }
+        [data-testid="stFileUploadDropzone"]:hover { background-color: rgba(74, 144, 226, 0.15) !important; border-color: #2c3e50 !important; }
+        .stButton>button { border-radius: 10px !important; height: 60px !important; font-weight: bold !important; font-size: 18px !important; box-shadow: 0 4px 6px rgba(0,0,0,0.1) !important; transition: all 0.2s ease-in-out !important; }
+        .stButton>button:hover { transform: translateY(-2px); box-shadow: 0 6px 8px rgba(0,0,0,0.15) !important; }
+        [data-testid="stMetric"] { background-color: #f7f9fc; padding: 15px; border-radius: 10px; box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.05); }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("⚙️ PID-Tuner: Модуль автоматической настройки")
+st.write("Локальный инструмент оптимизации для системы Honeywell Experion PKS.")
+
+# Xotira
+if 'K' not in st.session_state: st.session_state.K = 0.0
+if 'tau' not in st.session_state: st.session_state.tau = 0.0
+if 'T' not in st.session_state: st.session_state.T = 0.0
+if 'pv_initial' not in st.session_state: st.session_state.pv_initial = 0.0
+if 'delta_pv' not in st.session_state: st.session_state.delta_pv = 0.0
+if 'analyzed' not in st.session_state: st.session_state.analyzed = False
+
+# ==========================================
+# 2. ФАЙЛ ЮКЛАШ БЛОКИ
+# ==========================================
+st.markdown("### 📥 Загрузка данных")
+uploaded_file = st.file_uploader("Перетащите файл Excel (.xlsx) или CSV сюда", type=["xlsx", "xls", "csv"])
+
+if uploaded_file is not None:
+    file_ext = uploaded_file.name.split('.')[-1].lower()
+    with st.spinner('Чтение и обработка данных...'):
+        if file_ext in ['xlsx', 'xls']:
+            df_raw = pd.read_excel(uploaded_file)
+        else:
+            df_raw = pd.read_csv(uploaded_file, sep=None, engine='python')
+
+        for col in df_raw.columns:
+            if df_raw[col].dtype == object:
+                df_raw[col] = df_raw[col].astype(str).str.replace(',', '.')
+                try:
+                    df_raw[col] = pd.to_numeric(df_raw[col])
+                except:
+                    pass
+
+        rename_dict = {}
+        for col in df_raw.columns:
+            col_upper = col.upper()
+            if 'TIME' in col_upper:
+                rename_dict[col] = 'Time'
+            elif 'PV' in col_upper:
+                rename_dict[col] = 'PV'
+            elif 'SP' in col_upper:
+                rename_dict[col] = 'SP'
+            elif 'OP' in col_upper:
+                rename_dict[col] = 'OP'
+        df_raw = df_raw.rename(columns=rename_dict)
+
+        if not {'Time', 'PV', 'SP', 'OP'}.issubset(df_raw.columns):
+            st.error("❌ Ошибка: В загруженном файле не найдены столбцы Time, PV, SP или OP!")
+            st.stop()
+
+        df_raw['Time'] = pd.to_datetime(df_raw['Time'])
+        df_raw = df_raw.sort_values(by='Time').reset_index(drop=True)
+
+    st.success("✅ Файл успешно загружен!")
+    st.markdown("---")
+
+    # ==========================================
+    # ШАГ 1: ВРЕМЕННАЯ ОБРЕЗКА (QAYTARILGAN SLIDER)
+    # ==========================================
+    st.subheader("✂️ Шаг 1: Обрезка данных по времени (Интервал Step-test)")
+    st.write("Используйте ползунок, чтобы вырезать нужный участок (шаг ползунка — 1 минута):")
+
+    min_time = df_raw['Time'].min().to_pydatetime()
+    max_time = df_raw['Time'].max().to_pydatetime()
+
+    start_time, end_time = st.slider(
+        "Временной интервал:",
+        min_value=min_time,
+        max_value=max_time,
+        value=(min_time, max_time),
+        step=datetime.timedelta(minutes=1),
+        format="YYYY-MM-DD HH:mm:ss"
+    )
+
+    # Ma'lumotlar aynan shu oynada kesib olinadi
+    df = df_raw[(df_raw['Time'] >= start_time) & (df_raw['Time'] <= end_time)].reset_index(drop=True)
+    st.markdown("---")
+
+    # ==========================================
+    # ШАГ 2: АНАЛИЗ (AYNAN KESILGAN QISMNI TAHLILI)
+    # ==========================================
+    st.subheader("📉 Шаг 2: Идентификация и График")
+
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+    with col_btn2:
+        st.write("")
+        identify_clicked = st.button("🔍 АВТОМАТИЧЕСКАЯ ИДЕНТИФИКАЦИЯ", type="primary", use_container_width=True)
+
+    if identify_clicked:
+        try:
+            data_dt = df['Time'].diff().mean().total_seconds()
+            if pd.isna(data_dt) or data_dt <= 0: data_dt = 1.0
+
+            pv_smooth = gaussian_filter1d(df['PV'], sigma=5)
+            op_diff = df['OP'].diff().abs()
+            step_idx = op_diff.idxmax()
+
+            # Dinamika aynan siz qirqgan oynaning boshlang'ich va oxirgi nuqtasidan olinadi
+            delta_op = df['OP'].iloc[-10:].mean() - df['OP'].iloc[:step_idx].mean()
+            pv_initial = pv_smooth[:step_idx].mean()
+            pv_final = pv_smooth[-10:].mean()
+            delta_pv = pv_final - pv_initial
+
+            K_val = delta_pv / delta_op if delta_op != 0 else 1.0
+
+            threshold_start = pv_initial + 0.05 * delta_pv
+            threshold_63 = pv_initial + 0.632 * delta_pv
+
+            df_after, pv_after = df.iloc[step_idx:].copy(), pv_smooth[step_idx:]
+
+            if delta_pv > 0:
+                start_idx_val = df_after[pv_after >= threshold_start].index.min()
+                t63_idx = df_after[pv_after >= threshold_63].index.min()
+            else:
+                start_idx_val = df_after[pv_after <= threshold_start].index.min()
+                t63_idx = df_after[pv_after <= threshold_63].index.min()
+
+            raw_tau = (df['Time'].iloc[start_idx_val] - df['Time'].iloc[step_idx]).total_seconds()
+            raw_T = (df['Time'].iloc[t63_idx] - df['Time'].iloc[start_idx_val]).total_seconds()
+
+            st.session_state.K = float(abs(K_val))
+            st.session_state.tau = max(data_dt * 1, float(raw_tau))
+            st.session_state.T = max(data_dt * 1.5, float(raw_T))
+            st.session_state.pv_initial = float(pv_initial)
+            st.session_state.delta_pv = float(delta_pv)
+            st.session_state.analyzed = True
+
+        except Exception as e:
+            st.error("❌ Ошибка идентификации. Убедитесь, что внутри выбранного интервала есть скачок.")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(x=df['Time'], y=df['PV'], mode='lines', name='PV (Исходный)', line=dict(color='lightblue')))
+    if st.session_state.analyzed:
+        fig.add_trace(
+            go.Scatter(x=df['Time'], y=gaussian_filter1d(df['PV'], sigma=5), mode='lines', name='PV (Сглаженный)',
+                       line=dict(color='blue', width=2)))
+    fig.add_trace(go.Scatter(x=df['Time'], y=df['SP'], mode='lines', name='SP', line=dict(color='green', dash='dash')))
+    fig.add_trace(go.Scatter(x=df['Time'], y=df['OP'], mode='lines', name='OP', line=dict(color='red')))
+    fig.update_layout(xaxis_title="Время", yaxis_title="Значения", hovermode="x unified",
+                      margin=dict(l=0, r=0, t=10, b=0), height=450)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ==========================================
+    # ШАГ 3: PID ХИСОБЛАШ
+    # ==========================================
+    st.markdown("---")
+    st.subheader("⚙️ Шаг 3: Настройка ПИД-регулятора")
+
+    process_type = st.radio("Среда:",
+                            ("Жидкость (Сепараторы - Мягкая фильтрация для защиты от гидроударов)",
+                             "Газ (Трубопроводы - Быстрый отклик от перепадов давления)"),
+                            label_visibility="collapsed")
+
+    st.write("")
+    with st.expander("🛠 Дополнительные настройки: Ручная калибровка динамических параметров"):
+        col1, col2, col3 = st.columns(3)
+        with col1: K_proc = st.number_input("K (Коэф. усиления)", value=st.session_state.K, format="%.3f", step=0.1)
+        with col2: tau = st.number_input("𝜏 (Запаздывание, сек)", value=st.session_state.tau, format="%.2f", step=1.0,
+                                         min_value=0.0)
+        with col3: T_proc = st.number_input("T (Время процесса, сек)", value=st.session_state.T, format="%.2f",
+                                            step=1.0, min_value=0.0)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if tau <= 0 or T_proc <= 0 or K_proc == 0:
+        st.warning("⚠️ Для отображения параметров необходимо нажать кнопку 'АВТОМАТИЧЕСКАЯ ИДЕНТИФИКАЦИЯ'.")
+    else:
+        r = tau / T_proc
+        if r > 0.15:
+            best_method = "Коэн-Кун"
+            Kc = (1 / K_proc) * (T_proc / tau) * ((4 / 3) + (r / 4))
+            Ti = tau * (32 + 6 * r) / (13 + 8 * r)
+            Td = tau * 4 / (11 + 2 * r)
+
+            if r > 0.5:
+                Kc = Kc * 0.4
+                Ti = Ti * 1.5
+                Td = Td * 0.5
+        else:
+            best_method = "Зиглер-Никольс"
+            Kc = 1.2 * (T_proc / (K_proc * tau))
+            Ti = 2.0 * tau
+            Td = 0.5 * tau
+
+        if "Жидкость" in process_type:
+            Kc, Ti = Kc * 0.5, Ti * 1.5
+        else:
+            Kc = Kc * 0.4
+            Ti = Ti * 1.6
+
+        Ti = max(0.1, Ti)
+
+        st.info(
+            f"📊 **Анализ динамики:** Отношение (τ/T) = **{r:.2f}**. Выбран метод **«{best_method}»** с промышленной фильтрацией шумов.")
+
+        res_col1, res_col2, res_col3 = st.columns(3)
+        res_col1.metric(label="Пропорциональный (Kp)", value=f"{Kc:.3f}")
+        res_col2.metric(label="Время интегрирования (Ti), сек", value=f"{Ti:.2f}")
+        res_col3.metric(label="Время дифференцирования (Td), сек", value=f"{Td:.3f}")
+
+        # ==========================================
+        # ==========================================
+        # ШАГ 4: СИМУЛЯЦИЯ (Tuzatilgan Anti-Windup va Settling Time)
+        # ==========================================
+        st.markdown("---")
+        st.subheader("📈 Шаг 4: Моделирование и Экспорт")
+
+        pv_initial = st.session_state.pv_initial
+        delta_pv = st.session_state.delta_pv if st.session_state.delta_pv != 0 else 10.0
+        sp_target = pv_initial + delta_pv
+
+        if st.button("▶️ Запустить симуляцию", type="primary", use_container_width=True):
+            dt = max(0.01, min(0.1, T_proc / 200.0))
+            sim_time = max(100.0, 20 * T_proc + 10 * tau)
+            t_sim = np.arange(0, sim_time, dt)
+            n = len(t_sim)
+            delay_steps = max(1, int(tau / dt))
+
+            sp_sim = np.full(n, pv_initial)
+            step_time_idx = int((sim_time * 0.1) / dt)
+            if step_time_idx < n:
+                sp_sim[step_time_idx:] = sp_target
+
+            pv_sim = np.full(n, pv_initial)
+            op_sim = np.zeros(n)
+
+            integral_sum = 0.0
+            error_prev = 0.0
+
+            alpha = 0.1
+            Tf = alpha * Td
+            D_prev = 0.0
+
+            for i in range(1, n):
+                error = sp_sim[i] - pv_sim[i - 1]
+
+                # Proportsional qism
+                op_p = Kc * error
+
+                # Differensial qism (Filtrlangan)
+                delta_pv_sim = pv_sim[i - 1] - (pv_sim[i - 2] if i > 1 else pv_initial)
+                D_current = (Tf / (Tf + dt)) * D_prev - (Kc * Td / (Tf + dt)) * delta_pv_sim
+                op_d = D_current
+
+                # Integral qism (Avvalgi yig'indi bilan hisoblash)
+                op_i = (Kc / Ti) * integral_sum if Ti > 0 else 0.0
+
+                op_tentative = op_p + op_i + op_d
+
+                # ANTI-WINDUP (Clamping): Agar OP tiralgan bo'lsa va Xatolik uni yanada itarayotgan bo'lsa, Integralni to'xtatamiz.
+                is_saturated_high = (op_tentative >= 100.0 and error > 0)
+                is_saturated_low = (op_tentative <= -100.0 and error < 0)
+
+                if not (is_saturated_high or is_saturated_low):
+                    integral_sum += (error + error_prev) * 0.5 * dt
+
+                # Yangilangan integral bilan OP ni yakuniy hisoblash
+                op_i = (Kc / Ti) * integral_sum if Ti > 0 else 0.0
+                op = max(-100.0, min(op_p + op_i + op_d, 100.0))
+                op_sim[i] = op
+
+                # Obyekt (Plant - FOPDT) modeli
+                op_delayed = op_sim[i - delay_steps] if i >= delay_steps else 0.0
+                pv_dot = (K_proc * op_delayed - (pv_sim[i - 1] - pv_initial)) / T_proc
+                pv_sim[i] = pv_sim[i - 1] + pv_dot * dt
+
+                error_prev = error
+                D_prev = D_current
+
+            # -------------------- SIFAT METRIKALARI --------------------
+            if abs(delta_pv) > 1e-6:
+                if delta_pv > 0:
+                    max_pv = np.max(pv_sim[step_time_idx:])
+                    overshoot_val = max(0.0, max_pv - sp_target)
+                else:
+                    min_pv = np.min(pv_sim[step_time_idx:])
+                    overshoot_val = max(0.0, sp_target - min_pv)
+                overshoot_pct = (overshoot_val / abs(delta_pv)) * 100.0
+            else:
+                overshoot_pct = 0.0
+
+            # TUZATILGAN SETTLING TIME HISOBI
+            abs_err = np.abs(pv_sim[step_time_idx:] - sp_target)
+            tolerance = max(0.05 * abs(delta_pv), 1e-3)  # 5% koridor
+
+            exceeds = np.where(abs_err > tolerance)[0]
+
+            if len(exceeds) == 0:
+                settling_time = 0.0
+            else:
+                last_exceed_idx = exceeds[-1]
+                # Agar tebranish simulyatsiyaning so'nggi 2% qismigacha ham tinchimagan bo'lsa
+                if last_exceed_idx >= len(abs_err) - int(0.02 * len(abs_err)) - 1:
+                    settling_time = -1.0  # Tinchlanmagan
+                else:
+                    settling_time = t_sim[step_time_idx + last_exceed_idx] - t_sim[step_time_idx]
+
+            # -------------------------------------------------------------
+            fig_sim = go.Figure()
+            fig_sim.add_trace(
+                go.Scatter(x=t_sim, y=pv_sim, mode='lines', name='PV (Прогноз)', line=dict(color='blue', width=2)))
+            fig_sim.add_trace(
+                go.Scatter(x=t_sim, y=sp_sim, mode='lines', name='SP (Задание)', line=dict(color='green', dash='dash')))
+            fig_sim.update_layout(xaxis_title="Время (сек)", yaxis_title="Значение PV", hovermode="x unified",
+                                  height=400, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig_sim, use_container_width=True)
+
+            col_m1, col_m2 = st.columns(2)
+            col_m1.metric(label="Макс. перерегулирование (Overshoot)", value=f"{overshoot_pct:.1f} %")
+
+            if settling_time == 0.0:
+                val_settling = "0.0 сек"
+            elif settling_time > 0.0:
+                val_settling = f"{settling_time:.1f} сек"
+            else:
+                val_settling = "Не стабилизировался"
+
+            col_m2.metric(label="Время регулирования (Settling Time)", value=val_settling)
+
+            # ==========================================
+            # ШАГ 5: ЕКСПОРТ (HISOBOT)
+            # ==========================================
+            st.markdown("<br>", unsafe_allow_html=True)
+            report_text = f"""
+        ========================================
+        ОТЧЕТ НАСТРОЙКИ ПИД-РЕГУЛЯТОРА (PID-TUNER)
+        ========================================
+        Дата формирования: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+        1. ДИНАМИЧЕСКИЕ ПАРАМЕТРЫ ОБЪЕКТА:
+        ----------------------------------------
+        Коэффициент усиления (K): {K_proc:.3f}
+        Время чистого запаздывания (tau): {tau:.2f} сек
+        Постоянная времени (T): {T_proc:.2f} сек
+
+        2. ВЫБРАННЫЙ МЕТОД И СРЕДА:
+        ----------------------------------------
+        Тип рабочей среды: {'Уровень жидкости' if 'Жидкость' in process_type else 'Давление газа'}
+        Оптимальный алгоритм расчета: {best_method}
+
+        3. РЕКОМЕНДУЕМЫЕ ПАРАМЕТРЫ ДЛЯ C300:
+        ----------------------------------------
+        Пропорциональный коэффициент (Kp): {Kc:.3f}
+        Время интегрирования (Ti): {Ti:.2f} сек
+        Время дифференцирования (Td): {Td:.3f} сек
+
+        4. ПОКАЗАТЕЛИ КАЧЕСТВА (РЕЗУЛЬТАТ СИМУЛЯЦИИ):
+        ----------------------------------------
+        Максимальное перерегулирование: {overshoot_pct:.1f} %
+        Время регулирования: {val_settling}
+
+        ========================================
+        Сгенерировано программным модулем PID-Tuner.
+                    """
+            st.download_button(
+                label="📄 Скачать отчет (TXT файл)",
+                data=report_text,
+                file_name=f"PID_Tuning_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
